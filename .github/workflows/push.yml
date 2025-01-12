@@ -119,7 +119,7 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
-    needs: [check, test, lints]  # Ensure this job runs only if the previous jobs succeed
+    needs: [check, test]  # Ensure this job runs only if the previous jobs succeed
     steps:
       - name: Checkout sources
         uses: actions/checkout@v3
