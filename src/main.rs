@@ -4,10 +4,11 @@ use reqwest::blocking::Client;
 use reqwest::StatusCode;
 use serde_json::json;
 use std::fs::File;
-use std::io::Write;
+use std::io::{self, Write};
 use std::time::SystemTime;
-use std::{env, fs, io, process};
-use xmltree::{Element, XMLNode};
+use std::{env, fs, process};
+use quick_xml::events::Event;
+use quick_xml::Reader;
 
 /// A rbxlx postprocessor that decompiles everything inside 😋
 #[derive(Parser, Debug)]
@@ -32,77 +33,79 @@ struct Args {
     base_url: String,
 }
 
-fn walk_count(el: &Element, counter: &mut u64) {
-    if el
-        .attributes
-        .get("class")
-        .is_some_and(|class| class == "ModuleScript" || class == "LocalScript" || class == "Script")
-    {
-        *counter += 1;
-    }
+fn main() {
+    let args = Args::parse();
 
-    for child in el.children.iter() {
-        let Some(el) = child.as_element() else {
-            continue;
-        };
-        walk_count(el, counter);
-    }
-}
+    let env_key = env::var("ORACLE_KEY").ok();
+    let arg_key = args.key;
 
-fn walk(el: &mut Element, total: &u64, counter: &mut u64, oracle_url: &String, key: &String) {
-    if el.attributes.get("class").is_some_and(|class| {
-        class == "ModuleScript" || class == "LocalScript"
-    } || class == "Script")
-    {
-        *counter += 1;
-        let props = el
-            .children
-            .iter_mut()
-            .find(|it| it.as_element().is_some_and(|it| it.name == "Properties"))
-            .and_then(|it| it.as_mut_element());
+    let key = arg_key.or(env_key).unwrap_or_else(|| {
+        eprintln!("Oracle key not provided");
+        process::exit(1);
+    });
 
-        let script_name = props.as_ref()
-            .and_then(|it| {
-                    it.children.iter().find(|it| {
-                        it.as_element().is_some_and(|it| {
-                            it.attributes.get("name").is_some_and(|it| it == "Name")
-                        })
-                    })
-            })
-            .and_then(|it| { it.as_element().and_then(|it| it.children.first().and_then(|it| it.as_cdata())) });
+    let mut reader = Reader::from_file(&args.input_file).unwrap_or_else(|e| {
+        eprintln!("Can't read the file: {}", e);
+        process::exit(1);
+    });
 
-        print!(
-            "[{}/{}] Decompiling {}... ",
-            counter,
-            total,
-            script_name.unwrap_or("unknown")
-        );
-        let _ = io::stdout().flush();
+    let mut buf = Vec::new();
+    let mut output = Vec::new();
+    let mut in_script = false;
+    let mut script_name = String::new();
+    let mut script_source = String::new();
+    let mut total = 0u64;
+    let mut decompiled = 0u64;
 
-        let src_node = props
-            .and_then(|it| {
-                    it.children.iter_mut().find(|it| {
-                        it.as_element().is_some_and(|it| {
-                            it.attributes.get("name").is_some_and(|it| it == "Source")
-                        })
-                    })
-            })
-            .and_then(|it| it.as_mut_element());
+    let start = SystemTime::now();
 
-        if let Some(n) = src_node {
-            if let Some(source) = n.children.first().and_then(|it| it.as_cdata()) {
+    loop {
+        match reader.read_event(&mut buf) {
+            Ok(Event::Start(ref e)) if e.name() == b"Item" => {
+                if let Some(class) = e.attributes().find(|attr| attr.as_ref().unwrap().key == b"class") {
+                    let class = class.unwrap().unescape_and_decode_value(&reader).unwrap();
+                    if class == "ModuleScript" || class == "LocalScript" || class == "Script" {
+                        in_script = true;
+                        total += 1;
+                    }
+                }
+            }
+            Ok(Event::Start(ref e)) if in_script && e.name() == b"Properties" => {
+                script_name.clear();
+                script_source.clear();
+            }
+            Ok(Event::Start(ref e)) if in_script && e.name() == b"string" => {
+                if let Some(name) = e.attributes().find(|attr| attr.as_ref().unwrap().key == b"name") {
+                    let name = name.unwrap().unescape_and_decode_value(&reader).unwrap();
+                    if name == "Name" {
+                        script_name = reader.read_text(e.name(), &mut Vec::new()).unwrap();
+                    } else if name == "Source" {
+                        script_source = reader.read_text(e.name(), &mut Vec::new()).unwrap();
+                    }
+                }
+            }
+            Ok(Event::End(ref e)) if in_script && e.name() == b"Item" => {
+                in_script = false;
+                decompiled += 1;
+                print!(
+                    "[{}/{}] Decompiling {}... ",
+                    decompiled,
+                    total,
+                    script_name
+                );
+                let _ = io::stdout().flush();
+
                 let re = Regex::new(r"-- Bytecode \(Base64\):\n-- (.*)\n\n").unwrap();
                 let b64_bytecode = re
-                    .captures(source)
+                    .captures(&script_source)
                     .and_then(|it| it.get(1).map(|it| it.as_str()));
 
-                let watermark = source.lines().take(6).collect::<Vec<_>>().join("\n");
+                let watermark = script_source.lines().take(6).collect::<Vec<_>>().join("\n");
 
                 if let Some(bytecode) = b64_bytecode {
                     let start = SystemTime::now();
-                    
                     match Client::new()
-                        .post(oracle_url)
+                        .post(&args.base_url)
                         .header("Authorization", format!("Bearer {}", key))
                         .body(
                             serde_json::to_string(&json!({
@@ -116,9 +119,8 @@ fn walk(el: &mut Element, total: &u64, counter: &mut u64, oracle_url: &String, k
                             match dec.status() {
                                 StatusCode::OK => {
                                     if let Ok(deserialized) = dec.text() {
-                                        n.children[0] = XMLNode::CData(vec![watermark, deserialized].join("\n"));
+                                        script_source = format!("{}\n{}", watermark, deserialized);
                                     }
-
                                     let elapsed = start.elapsed()
                                         .expect("Time went backwards");
                                     println!("decompiled in {}ms!", elapsed.as_millis());
@@ -144,55 +146,13 @@ fn walk(el: &mut Element, total: &u64, counter: &mut u64, oracle_url: &String, k
                 } else {
                     println!("no bytecode!");
                 }
-            } else {
-                println!("malformed rbxlx");
             }
-        } else {
-            println!("malformed rbxlx");
+            Ok(Event::Eof) => break,
+            _ => (),
         }
+        buf.clear();
     }
 
-    for child in el.children.iter_mut() {
-        let Some(el) = child.as_mut_element() else {
-            continue;
-        };
-        walk(el, total, counter, oracle_url, key);
-    }
-}
-
-fn main() {
-    let args = Args::parse();
-
-    let env_key = env::var("ORACLE_KEY").ok();
-    let arg_key = args.key;
-
-    let key = arg_key.or(env_key).unwrap_or_else(|| {
-        eprintln!("Oracle key not provided");
-        process::exit(1);
-    });
-
-    let Ok(contents) = fs::read(args.input_file) else {
-        eprintln!("Can't read the file");
-        process::exit(1);
-    };
-
-    let Ok(mut rbx) = Element::parse(contents.as_slice()) else {
-        eprintln!("Can't parse the file");
-        process::exit(1);
-    };
-
-    print!("Counting scripts... ");
-    let _ = io::stdout().flush();
-
-    let mut total = 0u64;
-    walk_count(&rbx, &mut total);
-    println!("{}", total);
-
-    let start = SystemTime::now();
-
-    let mut decompiled = 0u64;
-    walk(&mut rbx, &total, &mut decompiled, &args.base_url, &key);
-    
     let elapsed = start.elapsed()
         .expect("Time went backwards");
     println!("Processed in {}s!", elapsed.as_secs());
@@ -200,10 +160,7 @@ fn main() {
     print!("Writing output to {}... ", args.output);
     let _ = io::stdout().flush();
 
-    let file = File::create(args.output).unwrap();
-
-    match rbx.write(file) {
-        Ok(_) => {println!("Done!");},
-        Err(e) => {println!("Can't write the file: {:?}", e);}
-    };
+    let mut file = File::create(args.output).unwrap();
+    file.write_all(&output).unwrap();
+    println!("Done!");
 }
